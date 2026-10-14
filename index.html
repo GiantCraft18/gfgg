@@ -1,0 +1,1324 @@
+<script>
+/* ============================================================
+   FLOWMANHWA — ОСНОВНОЙ СКРИПТ
+   Улучшенная версия: безопасность, производительность, UX
+   ============================================================ */
+
+// ============ УТИЛИТЫ ============
+const Utils = {
+    debounce(fn, delay = 300) {
+        let timer;
+        return (...args) => {
+            clearTimeout(timer);
+            timer = setTimeout(() => fn(...args), delay);
+        };
+    },
+
+    escapeHtml(str) {
+        if (str == null) return '';
+        const div = document.createElement('div');
+        div.textContent = String(str);
+        return div.innerHTML;
+    },
+
+    formatDate(date) {
+        return new Intl.DateTimeFormat('ru-RU', {
+            day: 'numeric', month: 'long', year: 'numeric'
+        }).format(new Date(date));
+    },
+
+    generateId() {
+        return `manhwa-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+    },
+
+    /** Хеширование пароля (SHA-256 + соль) */
+    async hashPassword(password, salt = 'flowmanhwa-static-salt-v1') {
+        if (!crypto?.subtle) {
+            // Fallback для небезопасных контекстов (HTTP)
+            let hash = 0;
+            const str = password + salt;
+            for (let i = 0; i < str.length; i++) {
+                hash = ((hash << 5) - hash) + str.charCodeAt(i);
+                hash |= 0;
+            }
+            return 'fb_' + Math.abs(hash).toString(16);
+        }
+        const encoder = new TextEncoder();
+        const data = encoder.encode(password + salt);
+        const hashBuf = await crypto.subtle.digest('SHA-256', data);
+        return Array.from(new Uint8Array(hashBuf))
+            .map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+};
+
+// ============ TOAST УВЕДОМЛЕНИЯ ============
+const Toast = {
+    container: null,
+
+    init() {
+        this.container = document.getElementById('toast-container');
+    },
+
+    show(message, type = 'info', duration = 3000) {
+        if (!this.container) return;
+        const toast = document.createElement('div');
+        toast.className = `toast toast-${type}`;
+        toast.textContent = message;
+        toast.setAttribute('role', 'status');
+        this.container.appendChild(toast);
+
+        requestAnimationFrame(() => toast.classList.add('show'));
+
+        setTimeout(() => {
+            toast.classList.remove('show');
+            setTimeout(() => toast.remove(), 300);
+        }, duration);
+    },
+
+    success(msg) { this.show(msg, 'success'); },
+    error(msg)   { this.show(msg, 'error', 4000); },
+    info(msg)    { this.show(msg, 'info'); },
+    warning(msg) { this.show(msg, 'warning'); }
+};
+
+// ============ ГЛОБАЛЬНЫЙ ЛОАДЕР ============
+const Loader = {
+    el: null,
+    init() { this.el = document.getElementById('global-loader'); },
+    show() { if (this.el) { this.el.classList.remove('hidden'); this.el.style.display = 'flex'; } },
+    hide() { if (this.el) { this.el.classList.add('hidden'); this.el.style.display = 'none'; } }
+};
+
+// ============ DATABASE (IndexedDB) ============
+class ManhwaDB {
+    constructor() {
+        this.dbName = 'FlowManhwaDB';
+        this.version = 1;
+        this.db = null;
+    }
+
+    async open() {
+        if (this.db) return this.db;
+        return new Promise((resolve, reject) => {
+            const request = indexedDB.open(this.dbName, this.version);
+            request.onupgradeneeded = (e) => {
+                const db = e.target.result;
+                if (!db.objectStoreNames.contains('manhwa')) {
+                    db.createObjectStore('manhwa', { keyPath: 'id' });
+                }
+                if (!db.objectStoreNames.contains('users')) {
+                    db.createObjectStore('users', { keyPath: 'username' });
+                }
+                if (!db.objectStoreNames.contains('meta')) {
+                    db.createObjectStore('meta', { keyPath: 'key' });
+                }
+            };
+            request.onsuccess = () => { this.db = request.result; resolve(this.db); };
+            request.onerror = () => reject(request.error);
+        });
+    }
+
+    async _tx(store, mode, fn) {
+        const db = await this.open();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(store, mode);
+            const os = tx.objectStore(store);
+            const result = fn(os);
+            tx.oncomplete = () => resolve(result?.result ?? result);
+            tx.onerror = () => reject(tx.error);
+            tx.onabort = () => reject(tx.error);
+        });
+    }
+
+    async saveManhwa(m) { return this._tx('manhwa', 'readwrite', os => os.put(m)); }
+    async getAllManhwa() {
+        const db = await this.open();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction('manhwa', 'readonly');
+            const req = tx.objectStore('manhwa').getAll();
+            req.onsuccess = () => resolve(req.result || []);
+            req.onerror = () => reject(req.error);
+        });
+    }
+    async deleteManhwa(id) { return this._tx('manhwa', 'readwrite', os => os.delete(id)); }
+    async saveUser(u) { return this._tx('users', 'readwrite', os => os.put(u)); }
+    async getAllUsers() {
+        const db = await this.open();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction('users', 'readonly');
+            const req = tx.objectStore('users').getAll();
+            req.onsuccess = () => resolve(req.result || []);
+            req.onerror = () => reject(req.error);
+        });
+    }
+    async clearManhwa() { return this._tx('manhwa', 'readwrite', os => os.clear()); }
+}
+
+const DB = new ManhwaDB();
+
+// ============ ДАННЫЕ ПО УМОЛЧАНИЮ ============
+const DEFAULT_MANHWA_DATA = [
+    {
+        id: 'solo-leveling',
+        title: "Поднятие Уровня в Одиночку",
+        author: "Chu-Gong",
+        genres: ["Фэнтези", "Приключения", "Экшен", "Сверхъестественное"],
+        description: "В мире, где пробуждаются Охотники, чтобы сражаться с монстрами из Врат, самый слабый Охотник, Сон Джин-Ву, сталкивается со смертью. Однако ему даруется таинственная 'Система', которая позволяет ему безгранично развиваться.",
+        coverImage: "https://placehold.co/400x600/030712/FFFFFF?text=Solo+Leveling",
+        rating: 4.8, reviewsCount: 12345, likes: "5M", views: "28M", bookmarksCount: "233K",
+        lastUpdate: "Сегодня, Глава 3",
+        sections: ['top', 'novelties', 'trending'],
+        tags: ["Веб", "В цвете", "Реинкарнация", "Магия", "Монстры"],
+        publisher: "ReBots", releaseStatus: "Продолжается",
+        translationStatus: "Не переводится (лицензировано)", ageRating: "16+",
+        altTitles: ["Solo Leveling"],
+        chapters: [
+            { title: "Пролог: Слабейший Охотник", images: [
+                "https://placehold.co/800x1200/1a1a1a/e2e8f0?text=Пролог+1",
+                "https://placehold.co/800x1200/1a1a1a/e2e8f0?text=Пролог+2",
+                "https://placehold.co/800x1200/1a1a1a/e2e8f0?text=Пролог+3"
+            ]},
+            { title: "Глава 1: Новая Система", images: [
+                "https://placehold.co/800x1200/1a1a1a/e2e8f0?text=Глава+1+Стр+1",
+                "https://placehold.co/800x1200/1a1a1a/e2e8f0?text=Глава+1+Стр+2"
+            ]}
+        ],
+        continueReading: { chapterIndex: 0, chapterTitle: "Пролог: Слабейший Охотник" }
+    },
+    {
+        id: 'tower-of-god',
+        title: "Башня Бога",
+        author: "SIU",
+        genres: ["Фэнтези", "Приключения", "Экшен", "Тайна"],
+        description: "Юноша Баам заходит в Башню в поисках своей единственной подруги Рэйчел. Каждый этаж — новый мир с собственными правилами, испытаниями и опасностями.",
+        coverImage: "https://placehold.co/400x600/030712/FFFFFF?text=Tower+of+God",
+        rating: 4.7, reviewsCount: 9876, likes: "3.5M", views: "18M", bookmarksCount: "150K",
+        lastUpdate: "1 час назад, Глава 560",
+        sections: ['top', 'trending'],
+        tags: ["Веб", "В цвете", "Фэнтези", "Приключения"],
+        publisher: "Webtoon", releaseStatus: "Продолжается",
+        translationStatus: "Переводится", ageRating: "12+",
+        altTitles: ["Tower of God"],
+        chapters: [
+            { title: "Глава 1: Башня", images: [
+                "https://placehold.co/800x1200/1a1a1a/e2e8f0?text=Глава+1+Стр+1",
+                "https://placehold.co/800x1200/1a1a1a/e2e8f0?text=Глава+1+Стр+2"
+            ]}
+        ],
+        continueReading: null
+    },
+    {
+        id: 'omniscient-reader',
+        title: "Всеведущий Читатель",
+        author: "Sing Shong",
+        genres: ["Фэнтези", "Регрессия", "Апокалипсис", "Игра"],
+        description: "Ким Докча — единственный, кто дочитал веб-новеллу до конца. Когда новелла становится реальностью, он использует свои знания, чтобы выжить.",
+        coverImage: "https://placehold.co/400x600/030712/FFFFFF?text=Omniscient+Reader",
+        rating: 4.9, reviewsCount: 15678, likes: "6M", views: "35M", bookmarksCount: "300K",
+        lastUpdate: "2 часа назад, Глава 305",
+        sections: ['top', 'novelties', 'trending'],
+        tags: ["Веб", "В цвете", "Регрессия", "Апокалипсис"],
+        publisher: "Redice Studio", releaseStatus: "Продолжается",
+        translationStatus: "Переводится", ageRating: "16+",
+        altTitles: ["Omniscient Reader's Viewpoint"],
+        chapters: [
+            { title: "Пролог: Конец Новеллы", images: [
+                "https://placehold.co/800x1200/1a1a1a/e2e8f0?text=Пролог+1",
+                "https://placehold.co/800x1200/1a1a1a/e2e8f0?text=Пролог+2"
+            ]}
+        ],
+        continueReading: null
+    },
+    {
+        id: 'return-of-the-mount-hua-sect',
+        title: "Возвращение Секты Горы Хуа",
+        author: "Бизо",
+        genres: ["Боевые искусства", "Комедия", "Приключения"],
+        description: "Чхонмён, великий мечник секты Горы Хуа, перерождается спустя сто лет в теле молодого попрошайки и обнаруживает, что его секта в упадке.",
+        coverImage: "https://placehold.co/400x600/030712/FFFFFF?text=Mount+Hua",
+        rating: 4.6, reviewsCount: 10234, likes: "4M", views: "22M", bookmarksCount: "180K",
+        lastUpdate: "Вчера, Глава 150",
+        sections: ['top', 'novelties'],
+        tags: ["Веб", "В цвете", "Боевые искусства", "Реинкарнация"],
+        publisher: "Naver Webtoon", releaseStatus: "Продолжается",
+        translationStatus: "Переводится", ageRating: "12+",
+        altTitles: ["Return of the Blossoming Blade"],
+        chapters: [
+            { title: "Пролог: Смерть Мечника", images: [
+                "https://placehold.co/800x1200/1a1a1a/e2e8f0?text=Пролог+1",
+                "https://placehold.co/800x1200/1a1a1a/e2e8f0?text=Пролог+2"
+            ]}
+        ],
+        continueReading: null
+    },
+    {
+        id: 'demon-lord-rising',
+        title: "Возвышение Владыки Демонов",
+        author: "Автор X",
+        genres: ["Фэнтези", "Приключения", "Месть"],
+        description: "История о демоническом лорде, который возвращается после тысячелетий сна, чтобы вернуть себе былую силу и отомстить.",
+        coverImage: "https://placehold.co/400x600/030712/FFFFFF?text=Demon+Lord",
+        rating: 4.7, reviewsCount: 9123, likes: "3.8M", views: "19M", bookmarksCount: "160K",
+        lastUpdate: "Сегодня, Глава 1",
+        sections: ['novelties', 'trending'],
+        tags: ["Веб", "В цвете", "Демоны", "Месть", "Перерождение"],
+        publisher: "Taptoon", releaseStatus: "Продолжается",
+        translationStatus: "Переводится", ageRating: "16+",
+        altTitles: ["Rise of the Demon Lord"],
+        chapters: [
+            { title: "Пролог: Пробуждение", images: [
+                "https://placehold.co/800x1200/1a1a1a/e2e8f0?text=Пролог+1",
+                "https://placehold.co/800x1200/1a1a1a/e2e8f0?text=Пролог+2"
+            ]},
+            { title: "Глава 1: Новый Мир", images: [
+                "https://placehold.co/800x1200/1a1a1a/e2e8f0?text=Глава+1+Стр+1",
+                "https://placehold.co/800x1200/1a1a1a/e2e8f0?text=Глава+1+Стр+2"
+            ]}
+        ],
+        continueReading: null
+    },
+    {
+        id: 'fist-demon-of-mount-hua',
+        title: "Демон Кулака Горы Хуа",
+        author: "Gang-Joo",
+        genres: ["Боевые искусства", "Экшен", "Регрессия"],
+        description: "Ветеран боевых искусств возвращается в прошлое, чтобы предотвратить катастрофу, которая уничтожит мир боевых искусств.",
+        coverImage: "https://placehold.co/400x600/030712/FFFFFF?text=Fist+Demon",
+        rating: 4.7, reviewsCount: 8901, likes: "3.1M", views: "16M", bookmarksCount: "130K",
+        lastUpdate: "3 часа назад, Глава 75",
+        sections: ['novelties', 'trending'],
+        tags: ["Веб", "В цвете", "Боевые искусства", "Регрессия"],
+        publisher: "Daum Webtoon", releaseStatus: "Продолжается",
+        translationStatus: "Переводится", ageRating: "16+",
+        altTitles: ["Fist Demon of Hwa-San"],
+        chapters: [
+            { title: "Глава 1: Возвращение Мастера", images: [
+                "https://placehold.co/800x1200/1a1a1a/e2e8f0?text=Глава+1+Стр+1",
+                "https://placehold.co/800x1200/1a1a1a/e2e8f0?text=Глава+1+Стр+2"
+            ]}
+        ],
+        continueReading: null
+    }
+];
+
+// ============ СОСТОЯНИЕ ПРИЛОЖЕНИЯ ============
+const State = {
+    allManhwa: [],
+    users: [],
+    currentUser: null,
+    currentManhwa: null,
+    currentChapterIndex: 0,
+    currentEditingManhwaId: null,
+    chapterCounter: 0,
+    homePageSections: { top: [], novelties: [], trending: [] }
+};
+
+// ============ DOM-ХЕЛПЕР ============
+const $ = (id) => document.getElementById(id);
+const $$ = (sel) => document.querySelectorAll(sel);
+
+// ============ ЗАГРУЗКА ДАННЫХ ============
+async function loadManhwaData() {
+    try {
+        let data = await DB.getAllManhwa();
+        if (!data || data.length === 0) {
+            console.log('[DB] Пусто. Инициализация данными по умолчанию.');
+            for (const m of DEFAULT_MANHWA_DATA) {
+                await DB.saveManhwa(m);
+            }
+            data = await DB.getAllManhwa();
+        }
+        State.allManhwa = data;
+        console.log(`[DB] Загружено ${data.length} манхв.`);
+    } catch (e) {
+        console.error('[DB] Ошибка загрузки:', e);
+        Toast.error('Ошибка загрузки данных');
+        State.allManhwa = DEFAULT_MANHWA_DATA;
+    }
+}
+
+async function saveManhwa(manhwa) {
+    try {
+        await DB.saveManhwa(manhwa);
+    } catch (e) {
+        console.error('[DB] Ошибка сохранения:', e);
+        Toast.error('Ошибка сохранения');
+    }
+}
+
+async function loadUsers() {
+    try {
+        State.users = await DB.getAllUsers();
+        console.log(`[DB] Загружено ${State.users.length} пользователей.`);
+    } catch (e) {
+        console.error('[DB] Ошибка загрузки пользователей:', e);
+        State.users = [];
+    }
+}
+
+async function saveUser(user) {
+    try {
+        await DB.saveUser(user);
+    } catch (e) {
+        console.error('[DB] Ошибка сохранения пользователя:', e);
+    }
+}
+
+async function initAdminAccount() {
+    if (!State.users.find(u => u.username === 'admin')) {
+        const hashedPwd = await Utils.hashPassword('admin');
+        const admin = {
+            username: 'admin',
+            email: 'admin@example.com',
+            password: hashedPwd,
+            role: 'admin'
+        };
+        await saveUser(admin);
+        State.users.push(admin);
+        console.log('[Auth] Аккаунт admin создан.');
+    }
+}
+
+// ============ АУТЕНТИФИКАЦИЯ ============
+async function setCurrentUser(user) {
+    State.currentUser = user;
+    try {
+        localStorage.setItem('currentUser', JSON.stringify({
+            username: user.username, email: user.email, role: user.role
+        }));
+    } catch (e) { /* ignore */ }
+    updateUIForUser();
+    Toast.success(`Добро пожаловать, ${user.username}!`);
+}
+
+function clearCurrentUser() {
+    State.currentUser = null;
+    localStorage.removeItem('currentUser');
+    updateUIForUser();
+    Toast.info('Вы вышли из аккаунта');
+}
+
+async function handleLogin(e) {
+    e.preventDefault();
+    const username = $('login-username').value.trim();
+    const password = $('login-password').value.trim();
+    const statusEl = $('login-status');
+
+    if (!username || !password) {
+        statusEl.textContent = 'Заполните все поля';
+        statusEl.style.display = 'block';
+        return;
+    }
+
+    Loader.show();
+    const hashedPwd = await Utils.hashPassword(password);
+    Loader.hide();
+
+    const user = State.users.find(u =>
+        (u.username === username || u.email === username) && u.password === hashedPwd
+    );
+
+    if (user) {
+        await setCurrentUser(user);
+        closeLoginModal();
+    } else {
+        statusEl.textContent = 'Неверный логин или пароль';
+        statusEl.style.display = 'block';
+    }
+}
+
+async function handleRegistration(e) {
+    e.preventDefault();
+    const username = $('reg-username').value.trim();
+    const email = $('reg-email').value.trim();
+    const password = $('reg-password').value;
+    const confirmPassword = $('reg-confirm-password').value;
+    const statusEl = $('registration-status');
+
+    const showError = (msg) => {
+        statusEl.textContent = msg;
+        statusEl.style.display = 'block';
+    };
+
+    if (password !== confirmPassword) return showError('Пароли не совпадают');
+    if (password.length < 6) return showError('Пароль должен содержать минимум 6 символов');
+    if (!/^[^@]+@[^@]+\.[^@]+$/.test(email)) return showError('Неверный формат почты');
+    if (State.users.some(u => u.username === username)) return showError('Логин занят');
+    if (State.users.some(u => u.email === email)) return showError('Почта уже зарегистрирована');
+
+    Loader.show();
+    const hashedPwd = await Utils.hashPassword(password);
+    Loader.hide();
+
+    const newUser = { username, email, password: hashedPwd, role: 'user' };
+    await saveUser(newUser);
+    State.users.push(newUser);
+    await setCurrentUser(newUser);
+    closeRegistrationModal();
+}
+
+function updateUIForUser() {
+    const u = State.currentUser;
+    const adminOnly = $$('.admin-only');
+    const authRequired = $$('.auth-required');
+    const guestOnly = $$('.guest-only');
+
+    // Сброс
+    const authBtn = $('auth-button');
+    if (authBtn) authBtn.replaceWith(authBtn.cloneNode(true));
+
+    const newAuthBtn = $('auth-button');
+    const logoutLink = $('logout-sidebar-link');
+    const sidebarUserBtn = $('sidebar-username-btn');
+    const sidebarLoginLink = $('sidebar-login-link');
+
+    if (u) {
+        // Авторизован
+        $('username-display').textContent = u.username;
+        if (newAuthBtn) {
+            newAuthBtn.style.cssText = 'padding: 0.25rem 0.75rem; border-radius: 9999px; font-weight: 600; background-color: var(--bg-tertiary); color: var(--text-secondary); font-size: 0.875rem;';
+            newAuthBtn.addEventListener('click', (e) => { e.stopPropagation(); openSidebar(); });
+        }
+        if ($('sidebar-username-display')) $('sidebar-username-display').textContent = u.username;
+        if (sidebarUserBtn) {
+            sidebarUserBtn.classList.remove('hidden');
+            sidebarUserBtn.addEventListener('click', (e) => { e.stopPropagation(); closeSidebar(); });
+        }
+        if (sidebarLoginLink) sidebarLoginLink.classList.add('hidden');
+        if (logoutLink) {
+            logoutLink.classList.remove('hidden');
+            logoutLink.addEventListener('click', (e) => {
+                e.stopPropagation(); e.preventDefault();
+                openLogoutConfirmModal();
+            });
+        }
+
+        guestOnly.forEach(el => el.classList.add('hidden'));
+        authRequired.forEach(el => el.classList.remove('hidden'));
+
+        if (u.role === 'admin') {
+            adminOnly.forEach(el => el.classList.remove('hidden'));
+        } else {
+            adminOnly.forEach(el => el.classList.add('hidden'));
+        }
+    } else {
+        // Гость
+        if ($('username-display')) $('username-display').textContent = 'Войти';
+        if (newAuthBtn) {
+            newAuthBtn.style.cssText = 'padding: 0.5rem 1rem; border-radius: 9999px; font-weight: 600; background-color: var(--accent); color: white;';
+            newAuthBtn.addEventListener('click', (e) => { e.stopPropagation(); openLoginModal(); });
+        }
+        if (sidebarUserBtn) sidebarUserBtn.classList.add('hidden');
+        if (sidebarLoginLink) {
+            sidebarLoginLink.classList.remove('hidden');
+            sidebarLoginLink.addEventListener('click', (e) => {
+                e.stopPropagation(); e.preventDefault();
+                closeSidebar(); openLoginModal();
+            });
+        }
+        if (logoutLink) logoutLink.classList.add('hidden');
+
+        authRequired.forEach(el => el.classList.add('hidden'));
+        guestOnly.forEach(el => el.classList.remove('hidden'));
+        adminOnly.forEach(el => el.classList.add('hidden'));
+    }
+}
+
+// ============ МОДАЛЬНЫЕ ОКНА ============
+function openLoginModal()  { $('login-modal').style.display = 'flex'; $('login-status').style.display = 'none'; $('login-form').reset(); document.body.style.overflow = 'hidden'; }
+function closeLoginModal() { $('login-modal').style.display = 'none'; document.body.style.overflow = ''; }
+function openRegistrationModal()  { $('registration-modal').style.display = 'flex'; $('registration-status').style.display = 'none'; $('registration-form').reset(); document.body.style.overflow = 'hidden'; }
+function closeRegistrationModal() { $('registration-modal').style.display = 'none'; document.body.style.overflow = ''; }
+function openLogoutConfirmModal()  { $('logout-confirm-modal').style.display = 'flex'; document.body.style.overflow = 'hidden'; }
+function closeLogoutConfirmModal() { $('logout-confirm-modal').style.display = 'none'; document.body.style.overflow = ''; }
+
+// ============ НАВИГАЦИЯ ============
+const VIEW_IDS = ['home-view','category-view','detail-view','reader-modal','placeholder-view','add-content-view'];
+
+function showView(view) {
+    VIEW_IDS.forEach(id => {
+        const el = $(id);
+        if (el) el.style.display = 'none';
+    });
+
+    if (!view) return;
+
+    let display = 'block';
+    if (view.id === 'reader-modal') display = 'flex';
+    view.style.display = display;
+
+    // Активные ссылки
+    $$('.nav-item').forEach(el => el.classList.remove('active'));
+    $$('.bottom-nav-item').forEach(el => el.classList.remove('active'));
+
+    if (view.id === 'home-view') {
+        $('home-link')?.classList.add('active');
+        $('bottom-nav-central-btn')?.classList.add('active');
+    } else if (view.id === 'category-view') {
+        $('catalog-nav-link')?.classList.add('active');
+    }
+
+    if (view.id !== 'reader-modal') window.scrollTo(0, 0);
+
+    // Плавающая кнопка
+    const floatBtn = $('floating-continue-reading-btn');
+    if (floatBtn) {
+        if (view.id === 'detail-view' && State.currentManhwa?.continueReading) {
+            floatBtn.classList.remove('hidden');
+            $('floating-continue-chapter').textContent = State.currentManhwa.continueReading.chapterTitle || '';
+        } else {
+            floatBtn.classList.add('hidden');
+        }
+    }
+}
+
+function navigateToDetail(id) {
+    updateDetailView(id);
+    showView($('detail-view'));
+    if (window.location.hash !== `#detail/${id}`) window.location.hash = `detail/${id}`;
+}
+
+function navigateToCategory(categoryId, title, showFilters = true) {
+    $('category-view-title').textContent = title;
+    const grid = $('category-manga-grid');
+    grid.innerHTML = '';
+
+    const items = categoryId === 'all'
+        ? State.allManhwa
+        : State.allManhwa.filter(m => m.sections?.includes(categoryId));
+
+    if (items.length === 0) {
+        grid.innerHTML = '<p style="grid-column: 1/-1; text-align:center; color:var(--text-secondary); padding:2rem;">Ничего не найдено</p>';
+    } else {
+        const frag = document.createDocumentFragment();
+        items.forEach(m => frag.appendChild(createManhwaCard(m)));
+        grid.appendChild(frag);
+    }
+
+    $('category-filters-container').classList.toggle('hidden', !showFilters);
+    showView($('category-view'));
+    if (window.location.hash !== `#category/${categoryId}`) window.location.hash = `category/${categoryId}`;
+}
+
+function navigateToPlaceholder(title, message, hash) {
+    $('placeholder-title').textContent = title;
+    $('placeholder-message').textContent = message;
+    showView($('placeholder-view'));
+    if (hash && window.location.hash !== `#${hash}`) window.location.hash = hash;
+}
+
+// ============ КАРТОЧКИ ============
+function createManhwaCard(manhwa, size = 'normal') {
+    const card = document.createElement('div');
+    card.className = 'card-interact';
+    const w = size === 'small' ? 'w-24' : 'w-32';
+    card.style.cssText = `flex: 0 0 auto; width: ${size === 'small' ? '6rem' : '8rem'}; background: var(--bg-tertiary); border-radius: var(--radius-md); overflow: hidden; cursor: pointer; border: 1px solid var(--border);`;
+    card.innerHTML = `
+        <img src="${Utils.escapeHtml(manhwa.coverImage)}" alt="Обложка ${Utils.escapeHtml(manhwa.title)}" loading="lazy" style="width:100%;height:10rem;object-fit:cover;">
+        <div style="padding: 0.5rem;">
+            <h3 style="font-size:0.875rem;font-weight:600;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:0.25rem;">${Utils.escapeHtml(manhwa.title)}</h3>
+            <p style="font-size:0.75rem;color:var(--text-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${Utils.escapeHtml(manhwa.author)}</p>
+        </div>
+    `;
+    card.addEventListener('click', () => navigateToDetail(manhwa.id));
+    return card;
+}
+
+// ============ ДОМАШНЯЯ СТРАНИЦА ============
+function updateHomePageSections() {
+    State.homePageSections = {
+        top: State.allManhwa.filter(m => m.sections?.includes('top')),
+        novelties: State.allManhwa.filter(m => m.sections?.includes('novelties')),
+        trending: State.allManhwa.filter(m => m.sections?.includes('trending'))
+    };
+}
+
+function renderHomePageSections() {
+    const renderInto = (containerId, items) => {
+        const c = $(containerId);
+        if (!c) return;
+        c.innerHTML = '';
+        const frag = document.createDocumentFragment();
+        items.forEach(m => frag.appendChild(createManhwaCard(m)));
+        c.appendChild(frag);
+    };
+
+    renderInto('top-manga-container', State.homePageSections.top);
+    renderInto('new-releases-container', State.homePageSections.novelties);
+    renderInto('trending-container', State.homePageSections.trending);
+
+    // Продолжить чтение
+    const continueContainer = $('continue-reading-container');
+    if (continueContainer) {
+        continueContainer.innerHTML = '';
+        const reading = State.allManhwa.filter(m => m.continueReading);
+        if (reading.length === 0) {
+            continueContainer.innerHTML = '<p style="color:var(--text-secondary);padding:1rem;">Нет активных сессий чтения</p>';
+        } else {
+            const frag = document.createDocumentFragment();
+            reading.forEach(m => frag.appendChild(createManhwaCard(m)));
+            continueContainer.appendChild(frag);
+        }
+    }
+
+    // Обновления
+    const updates = $('updates-list-container');
+    if (updates) {
+        updates.innerHTML = '';
+        const sorted = [...State.allManhwa].slice(0, 5);
+        const frag = document.createDocumentFragment();
+        sorted.forEach(m => {
+            const item = document.createElement('div');
+            item.className = 'update-item';
+            item.innerHTML = `
+                <img src="${Utils.escapeHtml(m.coverImage)}" alt="" loading="lazy">
+                <div class="update-item-content">
+                    <p class="update-item-title">${Utils.escapeHtml(m.title)}</p>
+                    <p class="update-item-info">${Utils.escapeHtml(m.lastUpdate || '')}</p>
+                </div>
+            `;
+            item.addEventListener('click', () => navigateToDetail(m.id));
+            frag.appendChild(item);
+        });
+        updates.appendChild(frag);
+    }
+}
+
+// ============ ДЕТАЛИ ============
+function updateDetailView(id) {
+    const m = State.allManhwa.find(x => x.id === id);
+    if (!m) { Toast.error('Манхва не найдена'); showView($('home-view')); return; }
+    State.currentManhwa = m;
+
+    $('detail-cover').src = m.coverImage || '';
+    $('detail-title').textContent = m.title;
+    $('detail-description').textContent = m.description;
+    $('detail-author').textContent = `Автор: ${m.author}`;
+    $('detail-genres').textContent = `Жанры: ${(m.genres || []).join(', ')}`;
+    $('detail-rating').textContent = m.rating || '—';
+    $('detail-reviews').textContent = `(${m.reviewsCount || 0} отзывов)`;
+    $('detail-likes').textContent = m.likes || '0';
+    $('detail-views').textContent = m.views || '0';
+    $('detail-bookmarks').textContent = m.bookmarksCount || '0';
+    $('detail-publishers').textContent = m.publisher || 'Неизвестно';
+    $('detail-release-status').textContent = m.releaseStatus || 'Неизвестно';
+    $('detail-translation-status').textContent = m.translationStatus || 'Неизвестно';
+    $('detail-age-rating').textContent = m.ageRating || '0+';
+    $('detail-alt-titles').textContent = Array.isArray(m.altTitles) ? m.altTitles.join(', ') : (m.altTitles || 'Нет');
+
+    // Теги
+    const tags = $('detail-tags-container');
+    tags.innerHTML = '';
+    (m.tags || []).forEach(t => {
+        const span = document.createElement('span');
+        span.style.cssText = 'background:var(--bg-tertiary);color:var(--text-secondary);font-size:0.875rem;padding:0.25rem 0.75rem;border-radius:9999px;border:1px solid var(--border);';
+        span.textContent = t;
+        tags.appendChild(span);
+    });
+
+    // Похожее
+    const similar = $('similar-works-container');
+    similar.innerHTML = '';
+    const other = State.allManhwa.filter(x => x.id !== id).slice(0, 4);
+    other.forEach(x => similar.appendChild(createManhwaCard(x)));
+
+    renderChapters();
+
+    // Показать кнопку редактирования для админа
+    const editBtn = $('edit-manhwa-btn');
+    if (editBtn) editBtn.classList.toggle('hidden', !(State.currentUser?.role === 'admin'));
+
+    // Переключить на overview
+    switchTab('overview');
+}
+
+function renderChapters() {
+    const list = $('detail-chapters-list');
+    if (!list || !State.currentManhwa?.chapters) return;
+    list.innerHTML = '';
+    const frag = document.createDocumentFragment();
+    State.currentManhwa.chapters.forEach((ch, i) => {
+        const li = document.createElement('li');
+        li.style.cssText = 'background:var(--bg-secondary);color:var(--text-primary);padding:0.75rem;border-radius:var(--radius-md);display:flex;justify-content:space-between;align-items:center;cursor:pointer;border:1px solid var(--border);transition:background var(--transition-fast);';
+        li.innerHTML = `
+            <span>${Utils.escapeHtml(ch.title)}</span>
+            <span style="color:var(--text-secondary);font-size:0.875rem;">(${ch.images?.length || 0} стр.)</span>
+        `;
+        li.addEventListener('click', () => openReader(i));
+        li.addEventListener('mouseenter', () => li.style.background = 'var(--bg-tertiary)');
+        li.addEventListener('mouseleave', () => li.style.background = 'var(--bg-secondary)');
+        frag.appendChild(li);
+    });
+    list.appendChild(frag);
+}
+
+function switchTab(name) {
+    $$('.tab-button').forEach(btn => {
+        const isActive = btn.dataset.tab === name;
+        btn.style.color = isActive ? 'var(--accent)' : 'var(--text-secondary)';
+        btn.style.borderBottomColor = isActive ? 'var(--accent)' : 'transparent';
+    });
+    $$('.tab-content').forEach(tc => tc.classList.remove('active'));
+    $(`${name}-tab`)?.classList.add('active');
+}
+
+// ============ РИДЕР ============
+function openReader(chapterIndex) {
+    const m = State.currentManhwa;
+    if (!m?.chapters?.[chapterIndex]) return;
+
+    State.currentChapterIndex = chapterIndex;
+    m.continueReading = {
+        chapterIndex,
+        chapterTitle: m.chapters[chapterIndex].title
+    };
+    saveManhwa(m);
+
+    $('reader-modal').style.display = 'flex';
+    document.body.classList.add('reader-active');
+    document.body.style.overflow = 'hidden';
+
+    loadFeedModeChapter();
+}
+
+function closeReader() {
+    $('reader-modal').style.display = 'none';
+    document.body.classList.remove('reader-active');
+    document.body.style.overflow = '';
+    showView($('detail-view'));
+}
+
+function loadFeedModeChapter() {
+    const feed = $('chapter-images-feed');
+    if (!feed || !State.currentManhwa) return;
+    feed.innerHTML = '';
+
+    const fragment = document.createDocumentFragment();
+
+    // Intersection Observer для ленивой загрузки
+    const observer = ('IntersectionObserver' in window)
+        ? new IntersectionObserver((entries) => {
+            entries.forEach(entry => {
+                if (entry.isIntersecting) {
+                    const img = entry.target;
+                    if (img.dataset.src) {
+                        img.src = img.dataset.src;
+                        img.removeAttribute('data-src');
+                    }
+                    observer.unobserve(img);
+                }
+            });
+        }, { rootMargin: '300px' })
+        : null;
+
+    for (let i = State.currentChapterIndex; i < State.currentManhwa.chapters.length; i++) {
+        const ch = State.currentManhwa.chapters[i];
+        if (!ch?.images?.length) continue;
+
+        ch.images.forEach((url, idx) => {
+            const img = document.createElement('img');
+            // Первые 3 изображения текущей главы — сразу
+            if (i === State.currentChapterIndex && idx < 3) {
+                img.src = url;
+            } else if (observer) {
+                img.dataset.src = url;
+                observer.observe(img);
+            } else {
+                img.src = url;
+            }
+            img.alt = `${ch.title}, стр. ${idx + 1}`;
+            img.className = 'feed-view-image-wrapper';
+            img.style.cssText = 'width:100%;height:auto;display:block;';
+            img.loading = 'lazy';
+            img.decoding = 'async';
+            fragment.appendChild(img);
+        });
+    }
+
+    feed.appendChild(fragment);
+    feed.scrollTop = 0;
+}
+
+function navigateToNextChapter() {
+    if (State.currentManhwa && State.currentChapterIndex < State.currentManhwa.chapters.length - 1) {
+        openReader(State.currentChapterIndex + 1);
+        Toast.info('Следующая глава');
+    } else {
+        Toast.info('Это последняя глава');
+    }
+}
+
+function navigateToPrevChapter() {
+    if (State.currentChapterIndex > 0) {
+        openReader(State.currentChapterIndex - 1);
+        Toast.info('Предыдущая глава');
+    } else {
+        Toast.info('Это первая глава');
+    }
+}
+
+// ============ SIDEBAR ============
+function openSidebar()  { $('sidebar')?.classList.add('open'); $('sidebar-overlay')?.classList.add('active'); document.body.style.overflow = 'hidden'; }
+function closeSidebar() { $('sidebar')?.classList.remove('open'); $('sidebar-overlay')?.classList.remove('active'); document.body.style.overflow = ''; }
+
+// ============ ADMIN: ФОРМА ============
+function addChapterInput(data = null) {
+    State.chapterCounter++;
+    const container = $('chapters-input-container');
+    const div = document.createElement('div');
+    div.className = 'chapter-entry';
+    div.dataset.index = State.chapterCounter - 1;
+    div.style.cssText = 'background:var(--bg-secondary);padding:1rem;border-radius:var(--radius-md);border:1px solid var(--border);position:relative;';
+
+    div.innerHTML = `
+        <h4 style="margin-bottom:0.75rem;font-weight:600;">Глава ${State.chapterCounter}</h4>
+        <input type="text" class="chapter-title-input" placeholder="Название главы" value="${data ? Utils.escapeHtml(data.title) : ''}" style="width:100%;padding:0.5rem;border-radius:var(--radius-md);background:var(--bg-tertiary);color:var(--text-primary);border:1px solid var(--border);margin-bottom:0.5rem;">
+        <div class="image-inputs-container" style="display:flex;flex-direction:column;gap:0.5rem;"></div>
+        <button type="button" class="add-image-btn btn-interact" style="margin-top:0.75rem;background:var(--bg-tertiary);color:white;padding:0.25rem 0.75rem;border-radius:var(--radius-md);font-size:0.875rem;">+ Страница</button>
+        <button type="button" class="remove-chapter-btn btn-interact" style="position:absolute;top:0.5rem;right:0.5rem;color:var(--danger);">✕</button>
+    `;
+    container.appendChild(div);
+
+    div.querySelector('.add-image-btn').addEventListener('click', () => {
+        addImageInput(div.querySelector('.image-inputs-container'));
+    });
+    div.querySelector('.remove-chapter-btn').addEventListener('click', () => {
+        div.remove();
+        renumberChapters();
+    });
+
+    const imgContainer = div.querySelector('.image-inputs-container');
+    if (data?.images?.length) {
+        data.images.forEach(url => addImageInput(imgContainer, url));
+    } else {
+        addImageInput(imgContainer);
+    }
+}
+
+function renumberChapters() {
+    const entries = $$('.chapter-entry');
+    State.chapterCounter = 0;
+    entries.forEach((div, i) => {
+        State.chapterCounter++;
+        div.dataset.index = i;
+        div.querySelector('h4').textContent = `Глава ${State.chapterCounter}`;
+    });
+}
+
+function addImageInput(container, initialUrl = null) {
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;align-items:center;gap:0.5rem;';
+    const uid = `img-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    row.innerHTML = `
+        <input type="file" accept="image/*" id="${uid}" class="chapter-image-file-input" style="flex:1;padding:0.5rem;border-radius:var(--radius-md);background:var(--bg-tertiary);color:var(--text-primary);border:1px solid var(--border);">
+        <img class="chapter-image-preview" style="width:4rem;height:5rem;object-fit:cover;border-radius:var(--radius-md);border:1px solid var(--border);${initialUrl ? '' : 'display:none;'}" src="${initialUrl || ''}" alt="">
+        <button type="button" class="remove-image-btn btn-interact" style="color:var(--danger);">✕</button>
+    `;
+    container.appendChild(row);
+
+    const input = row.querySelector(`#${uid}`);
+    const preview = row.querySelector('.chapter-image-preview');
+
+    if (initialUrl) input.dataset.imageUrl = initialUrl;
+
+    input.addEventListener('change', (e) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        if (file.size > 5 * 1024 * 1024) {
+            Toast.warning('Файл больше 5 МБ — может замедлить работу');
+        }
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+            preview.src = ev.target.result;
+            preview.style.display = 'block';
+            input.dataset.imageUrl = ev.target.result;
+        };
+        reader.readAsDataURL(file);
+    });
+
+    row.querySelector('.remove-image-btn').addEventListener('click', () => {
+        row.remove();
+        if (!container.querySelector('.image-input-row') && container.children.length === 0) {
+            addImageInput(container);
+        }
+    });
+}
+
+function fillManhwaFormForEdit(m) {
+    State.currentEditingManhwaId = m.id;
+    $('add-manhwa-form').querySelector('button[type="submit"]').textContent = 'Сохранить изменения';
+
+    $('manhwa-title').value = m.title || '';
+    $('manhwa-author').value = m.author || '';
+    $('manhwa-description').value = m.description || '';
+    $('manhwa-publisher').value = m.publisher || '';
+    $('manhwa-tags').value = Array.isArray(m.tags) ? m.tags.join(', ') : (m.tags || '');
+    $('manhwa-alt-titles').value = Array.isArray(m.altTitles) ? m.altTitles.join(', ') : (m.altTitles || '');
+
+    if (m.coverImage) {
+        $('manhwa-cover-preview').src = m.coverImage;
+        $('manhwa-cover-preview').style.display = 'block';
+        $('manhwa-cover-image').dataset.imageUrl = m.coverImage;
+    }
+
+    const genreSel = $('manhwa-genres');
+    Array.from(genreSel.options).forEach(opt => opt.selected = (m.genres || []).includes(opt.value));
+
+    if (m.releaseStatus) $('manhwa-release-status').value = m.releaseStatus;
+    if (m.translationStatus) $('manhwa-translation-status').value = m.translationStatus;
+    if (m.ageRating) $('manhwa-age-rating').value = m.ageRating;
+
+    const chaptersContainer = $('chapters-input-container');
+    chaptersContainer.innerHTML = '';
+    State.chapterCounter = 0;
+
+    if (m.chapters?.length) {
+        m.chapters.forEach(ch => addChapterInput(ch));
+    } else {
+        addChapterInput();
+    }
+}
+
+async function handleManhwaFormSubmit(e) {
+    e.preventDefault();
+
+    const coverData = $('manhwa-cover-image').dataset.imageUrl || '';
+    const title = $('manhwa-title').value.trim();
+
+    if (title.length < 2) { Toast.error('Название слишком короткое'); return; }
+
+    // Сбор глав
+    const chapters = [];
+    $$('.chapter-entry').forEach(div => {
+        const chTitle = div.querySelector('.chapter-title-input').value.trim();
+        const imgs = [];
+        div.querySelectorAll('.chapter-image-file-input').forEach(inp => {
+            if (inp.dataset.imageUrl) imgs.push(inp.dataset.imageUrl);
+        });
+        if (chTitle && imgs.length) chapters.push({ title: chTitle, images: imgs });
+    });
+
+    if (chapters.length === 0) { Toast.error('Добавьте хотя бы одну главу с изображениями'); return; }
+
+    const existing = State.currentEditingManhwaId
+        ? State.allManhwa.find(m => m.id === State.currentEditingManhwaId)
+        : null;
+
+    const data = {
+        title,
+        author: $('manhwa-author').value.trim(),
+        description: $('manhwa-description').value.trim(),
+        coverImage: coverData || existing?.coverImage || '',
+        genres: Array.from($('manhwa-genres').selectedOptions).map(o => o.value),
+        tags: $('manhwa-tags').value.split(',').map(t => t.trim()).filter(Boolean),
+        publisher: $('manhwa-publisher').value.trim() || 'Неизвестно',
+        releaseStatus: $('manhwa-release-status').value,
+        translationStatus: $('manhwa-translation-status').value,
+        ageRating: $('manhwa-age-rating').value,
+        altTitles: $('manhwa-alt-titles').value.split(',').map(t => t.trim()).filter(Boolean),
+        chapters,
+        rating: existing?.rating || 0,
+        reviewsCount: existing?.reviewsCount || 0,
+        likes: existing?.likes || '0',
+        views: existing?.views || '0',
+        bookmarksCount: existing?.bookmarksCount || '0',
+        lastUpdate: Utils.formatDate(Date.now()),
+        sections: existing?.sections || [],
+        continueReading: existing?.continueReading || null
+    };
+
+    Loader.show();
+    try {
+        if (existing) {
+            Object.assign(existing, data);
+            await saveManhwa(existing);
+            Toast.success(`"${title}" обновлена!`);
+        } else {
+            data.id = Utils.generateId();
+            State.allManhwa.push(data);
+            await saveManhwa(data);
+            Toast.success(`"${title}" добавлена!`);
+        }
+
+        updateHomePageSections();
+        renderHomePageSections();
+
+        $('add-manhwa-form').reset();
+        $('manhwa-cover-preview').style.display = 'none';
+        $('manhwa-cover-image').dataset.imageUrl = '';
+        $('chapters-input-container').innerHTML = '';
+        State.chapterCounter = 0;
+        $('add-manhwa-form').querySelector('button[type="submit"]').textContent = 'Добавить Манхву';
+
+        setTimeout(() => {
+            navigateToDetail(data.id || existing.id);
+        }, 500);
+    } catch (err) {
+        console.error(err);
+        Toast.error('Ошибка сохранения');
+    } finally {
+        Loader.hide();
+    }
+}
+
+// ============ ФИЛЬТРЫ КАТАЛОГА ============
+function applyFilters() {
+    const genre = $('genre-filter').value;
+    const status = $('status-filter').value;
+
+    let filtered = [...State.allManhwa];
+    if (genre) filtered = filtered.filter(m => (m.genres || []).includes(genre));
+    if (status) filtered = filtered.filter(m => m.releaseStatus === status);
+
+    const grid = $('category-manga-grid');
+    grid.innerHTML = '';
+    if (filtered.length === 0) {
+        grid.innerHTML = '<p style="grid-column:1/-1;text-align:center;padding:2rem;color:var(--text-secondary);">Ничего не найдено</p>';
+    } else {
+        const frag = document.createDocumentFragment();
+        filtered.forEach(m => frag.appendChild(createManhwaCard(m)));
+        grid.appendChild(frag);
+    }
+    Toast.info(`Найдено: ${filtered.length}`);
+}
+
+function resetFilters() {
+    $('genre-filter').value = '';
+    $('year-filter').value = '';
+    $('chapters-filter').value = '';
+    $('status-filter').value = '';
+    navigateToCategory('all', 'Каталог', true);
+}
+
+// ============ ИНИЦИАЛИЗАЦИЯ ============
+document.addEventListener('DOMContentLoaded', async () => {
+    Toast.init();
+    Loader.init();
+
+    // Загрузка данных
+    Loader.show();
+    await loadUsers();
+    await initAdminAccount();
+    await loadManhwaData();
+    Loader.hide();
+
+    updateHomePageSections();
+    renderHomePageSections();
+
+    // Восстановление сессии
+    const saved = localStorage.getItem('currentUser');
+    if (saved) {
+        try {
+            const parsed = JSON.parse(saved);
+            const full = State.users.find(u => u.username === parsed.username);
+            if (full) State.currentUser = full;
+        } catch (e) { localStorage.removeItem('currentUser'); }
+    }
+    updateUIForUser();
+
+    // Тема
+    const themeToggle = $('theme-toggle');
+    const isLight = localStorage.getItem('theme') === 'light';
+    document.body.classList.toggle('light-mode', isLight);
+    if (themeToggle) {
+        themeToggle.checked = isLight;
+        updateThemeToggleVisual(isLight);
+        themeToggle.addEventListener('change', () => {
+            const light = themeToggle.checked;
+            document.body.classList.toggle('light-mode', light);
+            localStorage.setItem('theme', light ? 'light' : 'dark');
+            updateThemeToggleVisual(light);
+        });
+    }
+
+    // === ОБРАБОТЧИКИ ===
+
+    // Хедер
+    $('home-link')?.addEventListener('click', (e) => { e.preventDefault(); showView($('home-view')); window.location.hash = ''; });
+    $('catalog-nav-link')?.addEventListener('click', (e) => { e.preventDefault(); navigateToCategory('all', 'Каталог', true); });
+    $('bookmarks-link')?.addEventListener('click', (e) => { e.preventDefault(); navigateToPlaceholder('Закладки', 'Раздел в разработке', 'bookmarks'); });
+    $('search-link')?.addEventListener('click', (e) => { e.preventDefault(); navigateToPlaceholder('Поиск', 'Раздел в разработке', 'search'); });
+    $('forum-link')?.addEventListener('click', (e) => { e.preventDefault(); navigateToPlaceholder('Форум', 'Раздел в разработке', 'forum'); });
+    $('desktop-settings-btn')?.addEventListener('click', (e) => { e.stopPropagation(); openSidebar(); });
+
+    // Кнопки Назад
+    $('back-to-home-from-category-btn')?.addEventListener('click', () => showView($('home-view')));
+    $('back-to-catalog-from-detail-btn')?.addEventListener('click', () => navigateToCategory('all', 'Каталог', true));
+    $('back-from-placeholder-btn')?.addEventListener('click', () => showView($('home-view')));
+    $('back-from-add-content-btn')?.addEventListener('click', () => showView($('home-view')));
+
+    // Показать все
+    $$('.show-all-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            navigateToCategory(btn.dataset.categoryId, btn.dataset.categoryTitle, false);
+        });
+    });
+
+    // Табы
+    $$('.tab-button').forEach(btn => {
+        btn.addEventListener('click', () => switchTab(btn.dataset.tab));
+    });
+
+    // Ридер
+    $('close-reader')?.addEventListener('click', closeReader);
+
+    // Плавающая кнопка
+    $('floating-continue-reading-btn')?.addEventListener('click', () => {
+        const c = State.currentManhwa?.continueReading;
+        if (c) openReader(c.chapterIndex);
+    });
+
+    // Редактирование
+    $('edit-manhwa-btn')?.addEventListener('click', () => {
+        if (State.currentUser?.role !== 'admin') return;
+        if (!State.currentManhwa) return;
+        fillManhwaFormForEdit(State.currentManhwa);
+        showView($('add-content-view'));
+        window.location.hash = `edit-content/${State.currentManhwa.id}`;
+    });
+
+    // Нижняя навигация
+    $$('.bottom-nav-item').forEach(item => {
+        item.addEventListener('click', () => {
+            const target = item.dataset.targetView;
+            if (target === 'category-view') navigateToCategory('all', 'Каталог', true);
+            else if (target === 'placeholder-view') navigateToPlaceholder(item.dataset.navCategory, 'Раздел в разработке', item.dataset.navCategory.toLowerCase());
+        });
+    });
+    $('bottom-nav-central-btn')?.addEventListener('click', () => showView($('home-view')));
+    $('mobile-menu-btn')?.addEventListener('click', (e) => { e.stopPropagation(); openSidebar(); });
+
+    // Сайдбар
+    $('close-sidebar-btn')?.addEventListener('click', closeSidebar);
+    $('sidebar-overlay')?.addEventListener('click', closeSidebar);
+
+    // Ссылки в сайдбаре
+    $$('.sidebar-item').forEach(item => {
+        item.addEventListener('click', (e) => {
+            if (item.id === 'logout-sidebar-link') return;
+            const href = item.getAttribute('href');
+            if (!href) return;
+            e.preventDefault();
+
+            if (href === '#catalog') navigateToCategory('all', 'Каталог', true);
+            else if (href === '#add-content') {
+                if (State.currentUser?.role !== 'admin') { Toast.error('Доступ только для админа'); return; }
+                State.currentEditingManhwaId = null;
+                $('add-manhwa-form').querySelector('button[type="submit"]').textContent = 'Добавить Манхву';
+                $('add-manhwa-form').reset();
+                $('chapters-input-container').innerHTML = '';
+                $('manhwa-cover-preview').style.display = 'none';
+                $('manhwa-cover-image').dataset.imageUrl = '';
+                State.chapterCounter = 0;
+                addChapterInput();
+                showView($('add-content-view'));
+                window.location.hash = 'add-content';
+            } else {
+                const titles = { '#bookmarks':'Закладки','#forum':'Форум','#history':'История','#feedback':'Обратная связь','#shop':'Магазин','#tops':'Топы','#settings':'Настройки','#promocodes':'Промокоды','#my-applications':'Мои заявки' };
+                navigateToPlaceholder(titles[href] || 'Раздел', `Раздел "${titles[href] || ''}" в разработке`, href.slice(1));
+            }
+            closeSidebar();
+        });
+    });
+
+    // Модальные окна
+    $('close-login-modal')?.addEventListener('click', closeLoginModal);
+    $('close-registration-modal')?.addEventListener('click', closeRegistrationModal);
+    $('show-registration-link')?.addEventListener('click', (e) => { e.preventDefault(); closeLoginModal(); openRegistrationModal(); });
+    $('show-login-link')?.addEventListener('click', (e) => { e.preventDefault(); closeRegistrationModal(); openLoginModal(); });
+    $('login-form')?.addEventListener('submit', handleLogin);
+    $('registration-form')?.addEventListener('submit', handleRegistration);
+    $('confirm-logout-btn')?.addEventListener('click', () => { clearCurrentUser(); closeLogoutConfirmModal(); });
+    $('cancel-logout-btn')?.addEventListener('click', closeLogoutConfirmModal);
+
+    // Форма
+    $('add-chapter-btn')?.addEventListener('click', () => addChapterInput());
+    $('manhwa-cover-image')?.addEventListener('change', (e) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+            $('manhwa-cover-preview').src = ev.target.result;
+            $('manhwa-cover-preview').style.display = 'block';
+            $('manhwa-cover-image').dataset.imageUrl = ev.target.result;
+        };
+        reader.readAsDataURL(file);
+    });
+    $('add-manhwa-form')?.addEventListener('submit', handleManhwaFormSubmit);
+
+    // Фильтры
+    $('apply-filters-btn')?.addEventListener('click', applyFilters);
+    $('reset-filters-btn')?.addEventListener('click', resetFilters);
+
+    // Комментарии
+    $('submit-comment-btn')?.addEventListener('click', () => {
+        const v = $('comment-input').value.trim();
+        if (!v) { Toast.error('Введите текст'); return; }
+        Toast.success('Комментарий отправлен!');
+        $('comment-input').value = '';
+    });
+
+    // Hash навигация
+    window.addEventListener('hashchange', async () => {
+        const hash = window.location.hash.slice(1);
+        if (!hash || hash === 'home') return showView($('home-view'));
+        if (hash.startsWith('detail/')) return navigateToDetail(hash.split('/')[1]);
+        if (hash.startsWith('category/')) {
+            const id = hash.split('/')[1];
+            const map = { top:'Топ Манги', novelties:'Новинки', trending:'Сейчас Читают', all:'Каталог' };
+            return navigateToCategory(id, map[id] || 'Каталог', id === 'all');
+        }
+        if (hash === 'add-content') return showView($('add-content-view'));
+        if (hash.startsWith('edit-content/')) {
+            const m = State.allManhwa.find(x => x.id === hash.split('/')[1]);
+            if (m) { fillManhwaFormForEdit(m); showView($('add-content-view')); }
+        }
+    });
+
+    // Инициализация вида
+    if (window.location.hash) {
+        window.dispatchEvent(new HashChangeEvent('hashchange'));
+    } else {
+        showView($('home-view'));
+    }
+
+    console.log('[App] Инициализация завершена.');
+});
+
+function updateThemeToggleVisual(isLight) {
+    const track = $('theme-toggle-track');
+    const thumb = $('theme-toggle-thumb');
+    if (!track || !thumb) return;
+    track.style.background = isLight ? 'var(--accent)' : 'var(--bg-tertiary)';
+    thumb.style.transform = isLight ? 'translateX(1.25rem)' : 'translateX(0)';
+}
+
+// ============ KEYBOARD ============
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+        if ($('reader-modal')?.style.display === 'flex') closeReader();
+        else if ($('sidebar')?.classList.contains('open')) closeSidebar();
+        else if ($('login-modal')?.style.display === 'flex') closeLoginModal();
+        else if ($('registration-modal')?.style.display === 'flex') closeRegistrationModal();
+    }
+    // Навигация стрелками в ридере
+    if ($('reader-modal')?.style.display === 'flex') {
+        if (e.key === 'ArrowRight') navigateToNextChapter();
+        if (e.key === 'ArrowLeft') navigateToPrevChapter();
+    }
+});
+
+// ============ ГЛОБАЛЬНЫЙ ПЕРЕХВАТ ОШИБОК ============
+window.addEventListener('error', (e) => {
+    console.error('[Global Error]', e.error);
+});
+window.addEventListener('unhandledrejection', (e) => {
+    console.error('[Unhandled Rejection]', e.reason);
+});
+
+// ============ ЭКСПОРТ В ГЛОБАЛЬНУЮ ОБЛАСТЬ ДЛЯ onclick ============
+window.navigateToDetail = navigateToDetail;
+window.navigateToCategory = navigateToCategory;
+</script>
+</body>
+</html>
